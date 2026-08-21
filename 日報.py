@@ -32,78 +32,80 @@ def clear_extracted_data():
     st.session_state.extracted_df = None
     st.session_state.is_reading = False
 
-# 時刻文字列（"HH:MM" または "H:MM"）を分（整数）に変換するヘルパー
-def time_str_to_minutes(t_str):
+# 時刻ヘルパー関数
+def time_to_min(t_str):
     try:
         parts = t_str.split(':')
         return int(parts[0]) * 60 + int(parts[1])
     except:
         return 0
 
+def min_to_str(m):
+    return f"{m//60}:{m%60:02d}"
+
 # ==========================================
-# 2. Excel生成ロジック (8:00-17:00時間外対応版)
+# 2. Excel生成ロジック (はみ出た時間外の自動分割版)
 # ==========================================
-def create_filled_excel(df_extracted, sheet1_name="人工集計", sheet2_name="日報明細", target_year=2024):
+def create_filled_excel(df_extracted, sheet1_name="人工集計", sheet2_name="日報明細", target_year=2024, reg_start_time="8:00", reg_end_time="17:00"):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = sheet1_name
     thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+
+    reg_start_min = time_to_min(reg_start_time) # 8:00 -> 480分
+    reg_end_min = time_to_min(reg_end_time)     # 17:00 -> 1020分
 
     raw_data_list = []
     unique_codes = []
     code_to_name = {}
     last_seen_code = ""
 
-    # --- 1. 生データの抽出と前処理 ---
+    # --- 1. 生データの抽出 ---
     if df_extracted is not None and not df_extracted.empty:
         for idx, row in df_extracted.iterrows():
             try:
-                if len(row) >= 4:
-                    m_str = str(row.get('月', '')).replace('月', '').strip()
-                    d_str = str(row.get('日', '')).replace('日', '').strip()
-                    t_val = str(row.get('時間', '')).strip()
+                m_str = str(row.get('月', '')).replace('月', '').strip()
+                d_str = str(row.get('日', '')).replace('日', '').strip()
+                t_val = str(row.get('時間', '')).strip()
 
-                    code_val = str(row.get('工事コード', '')).strip()
-                    code_val = re.sub(r'[^a-zA-Z0-9-]', '', code_val)
+                code_val = str(row.get('工事コード', '')).strip()
+                code_val = re.sub(r'[^a-zA-Z0-9-]', '', code_val)
 
-                    if not code_val or code_val.lower() in ['nan', 'none']:
-                        code_val = last_seen_code
-                    else:
-                        last_seen_code = code_val
+                if not code_val or code_val.lower() in ['nan', 'none']:
+                    code_val = last_seen_code
+                else:
+                    last_seen_code = code_val
 
-                    if code_val:
-                        code_to_name[code_val] = ""
+                if code_val:
+                    code_to_name[code_val] = ""
 
-                    content_val = str(row.get('業務内容', '')).strip()
-                    t_val = re.sub(r'[^0-9:]', '', t_val)
-                    if not t_val: continue
+                content_val = str(row.get('業務内容', '')).strip()
+                t_val = re.sub(r'[^0-9:]', '', t_val)
+                if not t_val: continue
 
-                    m = int(float(m_str))
-                    d = int(float(d_str))
+                m = int(float(m_str))
+                d = int(float(d_str))
 
-                    if code_val and code_val not in unique_codes:
-                        unique_codes.append(code_val)
+                if code_val and code_val not in unique_codes:
+                    unique_codes.append(code_val)
 
-                    break_raw = row.get('休憩', None)
-                    if pd.isna(break_raw) or str(break_raw).strip() == "" or break_raw is None:
-                        break_val = ""
-                    else:
-                        try: break_val = float(break_raw)
-                        except (ValueError, TypeError): break_val = ""
+                break_raw = row.get('休憩', None)
+                if pd.isna(break_raw) or str(break_raw).strip() == "" or break_raw is None:
+                    break_val = ""
+                else:
+                    try: break_val = float(break_raw)
+                    except (ValueError, TypeError): break_val = ""
 
-                    raw_data_list.append({
-                        'orig_idx': idx,
-                        'm': m, 'd': d, 'break': break_val,
-                        'time': t_val, 'code': code_val, 'content': content_val,
-                    })
+                raw_data_list.append({
+                    'orig_idx': idx,
+                    'm': m, 'd': d, 'break': break_val,
+                    'time': t_val, 'code': code_val, 'content': content_val,
+                    'site': str(row.get('現場名', ''))
+                })
             except Exception as e:
-                print(f"データ処理エラー: {e}")
+                print(f"Excel前処理エラー: {e}")
 
-    # --- 2. 日付ごとに始業・終業時刻を確定させ、「日勤」か「時間外・残業」かを判定 ---
-    # 8:00 = 480分, 17:00 = 1020分
-    REG_START_MIN = 8 * 60
-    REG_END_MIN = 17 * 60
-
+    # --- 2. 日毎に連続する時間を追跡し、定時内外（8:00〜17:00）で自動分割 ---
     grouped_raw = {}
     for entry in raw_data_list:
         key = (entry['m'], entry['d'])
@@ -111,37 +113,68 @@ def create_filled_excel(df_extracted, sheet1_name="人工集計", sheet2_name="�
         grouped_raw[key].append(entry)
 
     data_list = []
+
     for (m, d), entries in grouped_raw.items():
-        current_start_str = "8:00"
         try:
             d_obj = date(target_year, m, d)
             is_hol = is_holiday_jp(d_obj)
         except:
             is_hol = False
 
-        for idx_in_day, entry in enumerate(entries):
-            end_str = entry['time']
-            start_str = current_start_str
+        first_end_min = time_to_min(entries[0]['time'])
+        # 朝の開始時間判定: 最初の終了時刻が8:00より前ならその時刻を開始地点にする
+        curr_start = first_end_min if first_end_min < reg_start_min else reg_start_min
 
-            start_min = time_str_to_minutes(start_str)
-            end_min = time_str_to_minutes(end_str)
+        for entry in entries:
+            end_min = time_to_min(entry['time'])
+            if end_min <= curr_start:
+                curr_start = end_min
+                continue
 
-            # 判定条件：
-            # 休日である OR 始業が8:00より前 OR 終業が17:00より後 の場合は「残業/時間外」
-            if is_hol or start_min < REG_START_MIN or end_min > REG_END_MIN:
-                cat = "残業/時間外"
-            else:
-                cat = "日勤"
+            s_min = curr_start
+            e_min = end_min
+            curr_start = end_min # 次の作業の始業時刻は現在の終業時刻
 
-            entry['start_time'] = start_str
-            entry['end_time'] = end_str
-            entry['category'] = cat
-            data_list.append(entry)
+            # 休日の場合は時間帯にかかわらず全て「残業・休日出勤」枠へ配置
+            if is_hol:
+                ne = dict(entry)
+                ne['start_time'] = min_to_str(s_min)
+                ne['end_time'] = min_to_str(e_min)
+                ne['category'] = "残業/時間外"
+                data_list.append(ne)
+                continue
 
-            # 次の作業の開始時間は、この作業の終了時間
-            current_start_str = end_str
+            # A. 早朝残業 (0:00 〜 8:00)
+            if s_min < reg_start_min:
+                em_e = min(e_min, reg_start_min)
+                ne = dict(entry)
+                ne['start_time'] = min_to_str(s_min)
+                ne['end_time'] = min_to_str(em_e)
+                ne['category'] = "残業/時間外"
+                ne['break'] = "" # 休憩は定時枠に優先割り当て
+                data_list.append(ne)
 
-    # --- 3. ヘッダー定義 ---
+            # B. 定時日勤 (8:00 〜 17:00)
+            reg_s = max(s_min, reg_start_min)
+            reg_e = min(e_min, reg_end_min)
+            if reg_s < reg_e:
+                ne = dict(entry)
+                ne['start_time'] = min_to_str(reg_s)
+                ne['end_time'] = min_to_str(reg_e)
+                ne['category'] = "日勤"
+                data_list.append(ne)
+
+            # C. 夕方残業 (17:00 〜 24:00)
+            if e_min > reg_end_min:
+                ev_s = max(s_min, reg_end_min)
+                ne = dict(entry)
+                ne['start_time'] = min_to_str(ev_s)
+                ne['end_time'] = min_to_str(e_min)
+                ne['category'] = "残業/時間外"
+                ne['break'] = "" # 休憩は定時枠に優先割り当て
+                data_list.append(ne)
+
+    # --- 3. ヘッダー構造の設定 ---
     headers_left = [
         ("B", "月"), ("C", "日"), ("D", "曜日"), ("E", "休・出"), ("F", "摘要"),
         ("G", "始業"), ("H", "終業"), ("I", "時間"), ("J", "休憩"), ("K", "時間"), ("L", "人工")
@@ -191,7 +224,7 @@ def create_filled_excel(df_extracted, sheet1_name="人工集計", sheet2_name="�
     reg_data = [d for d in data_list if d.get('category') == "日勤"]
     hol_data = [d for d in data_list if d.get('category') != "日勤"]
 
-    # --- 4. Excel行書き込み用関数 ---
+    # --- 4. 行書き込み処理 ---
     def fill_rows(ws, data_rows, start_row_idx, total_label="計", is_continuous=False):
         r_idx = start_row_idx
         grouped = {}
@@ -209,13 +242,12 @@ def create_filled_excel(df_extracted, sheet1_name="人工集計", sheet2_name="�
             ws[f'F{r_idx}'] = ""
 
             entry['final_excel_row'] = r_idx
-            # 始業時間・終業時間を計算済みの値から出力
             ws[f'G{r_idx}'] = entry['start_time']
             ws[f'H{r_idx}'] = entry['end_time']
             ws[f'I{r_idx}'] = f'=IF(OR(G{r_idx}="", H{r_idx}=""), "", (H{r_idx}-G{r_idx})*24)'
             b_val = entry.get('break')
             ws[f'J{r_idx}'] = None if b_val == "" else b_val
-            ws[f'K{r_idx}'] = f'=IF(I{r_idx}="","",I{r_idx}-J{r_idx})'
+            ws[f'K{r_idx}'] = f'=IF(I{r_idx}="","",I{r_idx}-IF(J{r_idx}="",0,J{r_idx}))'
             ws[f'L{r_idx}'] = f'=IF(K{r_idx}="","",K{r_idx}/7)'
 
             col_t_idx = 13 + unique_codes.index(entry['code']) * 2 if entry.get('code') in unique_codes else start_col_idx - 2
@@ -300,7 +332,7 @@ def create_filled_excel(df_extracted, sheet1_name="人工集計", sheet2_name="�
             r_idx += 1
         return r_idx
 
-    # --- 5. データの出力実行 ---
+    # --- 5. 出力実行 ---
     write_headers(ws, 4, header_blocks)
     next_row = fill_rows(ws, reg_data, 5, total_label="日勤計", is_continuous=True)
     
@@ -312,23 +344,22 @@ def create_filled_excel(df_extracted, sheet1_name="人工集計", sheet2_name="�
         next_row = fill_rows(ws, hol_data, next_row + 1, total_label="残業計", is_continuous=False)
 
     sheet1_row_mapping = {}
-    for d in data_list:
-        if 'orig_idx' in d and 'final_excel_row' in d:
-            sheet1_row_mapping[d['orig_idx']] = d['final_excel_row']
+    for idx_key, d in enumerate(data_list):
+        if 'final_excel_row' in d:
+            sheet1_row_mapping[idx_key] = d['final_excel_row']
 
-    # --- 6. 2枚目のシート(日報明細)を作成 ---
+    # --- 6. 2枚目シート(日報明細)の出力 ---
     ws2 = wb.create_sheet(title=sheet2_name)
     headers_s2 = ["月", "日", "始業", "終業", "時間", "休憩", "実労時間", "工事コード", "現場名", "業務内容"]
     for col_idx, h in enumerate(headers_s2, start=1):
         c = ws2.cell(row=2, column=col_idx, value=h)
         c.font = Font(bold=True); c.border = thin_border; c.alignment = Alignment(horizontal="center", vertical="center")
 
-    if df_extracted is not None and not df_extracted.empty:
+    if data_list:
         r_idx = 3
         prev_m, prev_d = None, None
         
-        # 明細行の書き込み（算出済みの start_time, end_time を利用）
-        for idx, entry in enumerate(data_list):
+        for idx_key, entry in enumerate(data_list):
             m_num = entry['m']
             d_num = entry['d']
 
@@ -344,18 +375,15 @@ def create_filled_excel(df_extracted, sheet1_name="人工集計", sheet2_name="�
             ws2[f'D{r_idx}'] = entry['end_time']
             ws2[f'E{r_idx}'] = f'=IF(OR(C{r_idx}="", D{r_idx}=""), "", (D{r_idx}-C{r_idx})*24)'
             
-            if idx in sheet1_row_mapping:
-                s1_r = sheet1_row_mapping[idx]
+            if idx_key in sheet1_row_mapping:
+                s1_r = sheet1_row_mapping[idx_key]
                 ws2[f'F{r_idx}'] = f'=IF(\'{sheet1_name}\'!J{s1_r}="","",\'{sheet1_name}\'!J{s1_r})'
             else:
                 ws2[f'F{r_idx}'] = entry.get('break', '')
 
             ws2[f'G{r_idx}'] = f'=IF(E{r_idx}="","",E{r_idx}-IF(F{r_idx}="",0,F{r_idx}))'
             ws2[f'H{r_idx}'] = entry['code']
-            
-            # 元のDataframeから現場名と業務内容を取得
-            orig_row = df_extracted.iloc[entry['orig_idx']] if entry['orig_idx'] < len(df_extracted) else {}
-            ws2[f'I{r_idx}'] = str(orig_row.get('現場名', ''))
+            ws2[f'I{r_idx}'] = entry.get('site', '')
             ws2[f'J{r_idx}'] = entry['content']
 
             for col_letter in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J']:
@@ -385,7 +413,7 @@ def create_filled_excel(df_extracted, sheet1_name="人工集計", sheet2_name="�
     return wb
 
 # ==========================================
-# 3. Streamlit UI (以下変更なし)
+# 3. Streamlit UI
 # ==========================================
 st.title("📋 日報 ")
 
