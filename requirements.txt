@@ -1,0 +1,7 @@
+streamlit
+pandas
+Pillow
+openpyxl
+google-genai
+google-auth
+jpholiday
